@@ -8,7 +8,6 @@ import logging
 from typing import Dict, List, Optional, Tuple
 from config import ADMIN_USER_IDS
 
-
 logger = logging.getLogger(__name__)
 
 # Track user request timestamps for rate-limiting
@@ -18,10 +17,15 @@ BLOCK_DURATION_SECONDS = 60
 _BLOCKED_USERS: Dict[int, float] = {}
 
 def is_admin_user(user_id: int) -> bool:
-    """Checks if the interacting user is an authorized admin."""
+    """
+    Checks if the interacting user is an authorized admin.
+    SECURITY FIX (Issue 4): Fail-Closed!
+    If ADMIN_USER_IDS is empty, nobody is an admin (returns False).
+    Never allows random users to broadcast to the channel.
+    """
     if not ADMIN_USER_IDS:
-        # If no admin IDs are configured, allow default operations
-        return True
+        logger.warning(f"Unauthorized broadcast attempt by user_id={user_id}. ADMIN_USER_IDS is empty in .env.")
+        return False
     return user_id in ADMIN_USER_IDS
 
 

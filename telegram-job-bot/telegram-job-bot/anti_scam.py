@@ -200,8 +200,9 @@ def multi_scan_job_verification(job: Dict[str, Any]) -> Tuple[bool, float, List[
         trust_score -= 0.20
 
     trust_score = max(0.0, min(1.0, trust_score))
-    # Zero-tolerance: Must have high score and NO scam flags
-    is_safe = (trust_score >= 0.70) and (len(all_flags) == 0)
+    # Threshold Consistency Fix (Issue 7): Uses CONFIDENCE_THRESHOLD from config.py
+    from config import CONFIDENCE_THRESHOLD
+    is_safe = (trust_score >= CONFIDENCE_THRESHOLD) and (len(all_flags) == 0)
 
     return is_safe, trust_score, all_flags
 

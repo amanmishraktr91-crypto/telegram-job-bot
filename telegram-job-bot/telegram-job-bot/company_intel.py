@@ -62,6 +62,7 @@ class InvestigatorAgent:
         ghost_risk = "🟢 Low Risk (Real Active Opening)" if is_fresh else "🟡 Medium (Screening Ongoing)"
 
         return {
+            "tier": matched["tier"] if matched else "General Corporate",
             "estimated_salary": est_salary,
             "company_rating": rating,
             "competition_level": competition,
@@ -89,9 +90,12 @@ class AuditorCriticAgent:
 
         # Sanity Check 2: Competition Calibration
         c_lower = company.lower()
+        c_tier = investigator_report.get("tier", "").lower()
         if any(top in c_lower for top in ["google", "amazon", "apple", "microsoft"]):
             corrections["competition_level"] = "🔴 Ultra High (Top 2-3% Selection Ratio)"
             corrections["time_saver_tip"] = "Tier-1 Bar: Highlight complex system problems or product impact to get shortlisted."
+        elif "global it" in c_tier:
+            corrections["competition_level"] = "🟢 High Hiring Volume (Multiple Round Shortlists)"
 
         return {
             "is_valid": len(audit_flags) == 0,

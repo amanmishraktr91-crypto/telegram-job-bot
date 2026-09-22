@@ -1,6 +1,7 @@
 """
-Multi-Source Job Aggregator
+Multi-Source Job Aggregator with Watchdog Integration
 Aggregates job listings across LinkedIn, Google Jobs, Naukri, and Indeed.
+Protected by OutputAuditor, GeoSentinel, and AutoHealer.
 """
 
 import urllib.parse
@@ -8,7 +9,9 @@ import requests
 from bs4 import BeautifulSoup
 from typing import List, Dict, Any
 import logging
+import re
 from config import SERPAPI_KEY
+from self_healing_watchdog import OutputAuditor, GeoSentinel, CompanyTruthSentinel, auto_heal_sync, health_sentinel
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,29 +24,63 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-def fetch_linkedin_public_jobs(query: str, location: str, limit: int = 15) -> List[Dict[str, Any]]:
+# Compatibility helper
+def is_relevant_job(query: str, title: str) -> bool:
+    return OutputAuditor.audit_job(query, {"title": title})
+
+def is_location_match(job_location: str, target_location: str) -> bool:
+    return GeoSentinel.verify_location(job_location, target_location)
+
+
+@auto_heal_sync(max_retries=2, delay=1.0, fallback_return=[])
+def fetch_linkedin_public_jobs(query: str, location: str, limit: int = 25) -> List[Dict[str, Any]]:
     """
     Fetches real active job listings directly from LinkedIn's public job endpoint.
-    Requires no login credentials.
+    Protected by AutoHealer retry shield and strict OutputAuditor + GeoSentinel validators.
     """
     jobs = []
-    try:
-        encoded_query = urllib.parse.quote(query)
-        encoded_location = urllib.parse.quote(location)
+    loc_search = location.strip()
+    is_pan_india = loc_search.lower() in ["india", "all india"]
+
+    if not re.search(r'\b(usa|united states|uk|canada|germany|dubai)\b', loc_search, re.IGNORECASE):
+        if "india" not in loc_search.lower():
+            loc_search = f"{loc_search}, India"
+
+    encoded_query = urllib.parse.quote(query)
+    encoded_location = urllib.parse.quote(loc_search)
+
+    # For specific cities, paginate pages (0, 25, 50) to collect sufficient city-specific jobs
+    pages = [0, 25] if is_pan_india else [0, 25, 50]
+
+    failed_pages = 0
+    for start_idx in pages:
+        if len(jobs) >= limit:
+            break
+
         url = (
             f"https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?"
-            f"keywords={encoded_query}&location={encoded_location}&start=0"
+            f"keywords={encoded_query}&location={encoded_location}&start={start_idx}"
         )
 
-        response = requests.get(url, headers=HEADERS, timeout=12)
-        if response.status_code != 200:
-            logger.warning(f"LinkedIn public API returned status: {response.status_code}")
-            return jobs
+        try:
+            response = requests.get(url, headers=HEADERS, timeout=10)
+            if response.status_code != 200:
+                failed_pages += 1
+                continue
+        except Exception as req_err:
+            failed_pages += 1
+            logger.warning(f"Error fetching LinkedIn page {start_idx}: {req_err}")
+            continue
 
         soup = BeautifulSoup(response.text, "html.parser")
         job_cards = soup.find_all("li")
+        if not job_cards:
+            break
 
-        for card in job_cards[:limit]:
+        for card in job_cards:
+            if len(jobs) >= limit:
+                break
+
             title_tag = card.find("h3", class_="base-search-card__title")
             company_tag = card.find("h4", class_="base-search-card__subtitle")
             location_tag = card.find("span", class_="job-search-card__location")
@@ -56,6 +93,19 @@ def fetch_linkedin_public_jobs(query: str, location: str, limit: int = 15) -> Li
             title = title_tag.get_text(strip=True)
             company = company_tag.get_text(strip=True)
             loc = location_tag.get_text(strip=True) if location_tag else location
+
+            # WATCHDOG 1: OutputAuditor verifies role relevance (blocks dishwashers, sales trainees, etc.)
+            if not OutputAuditor.audit_job(query, {"title": title}):
+                continue
+
+            # WATCHDOG 2: GeoSentinel verifies exact geographic boundaries (Noida vs India)
+            if not GeoSentinel.verify_location(loc, location):
+                continue
+
+            # WATCHDOG 3: CompanyTruthSentinel blocks generic shells ('Confidential', 'Urgent Hiring')
+            if not CompanyTruthSentinel.is_authentic_company(company):
+                continue
+
             apply_link = link_tag.get("href", "").split("?")[0] if link_tag else ""
             posted_at = time_tag.get_text(strip=True) if time_tag else "Recently"
 
@@ -70,81 +120,96 @@ def fetch_linkedin_public_jobs(query: str, location: str, limit: int = 15) -> Li
                 "posted_at": posted_at
             })
 
-        # Prioritize jobs whose location explicitly mentions the target city
-        target_city = location.strip().lower()
-        exact_matches = [j for j in jobs if target_city in j["location"].lower()]
-        other_matches = [j for j in jobs if target_city not in j["location"].lower()]
-        jobs = exact_matches + other_matches
-
-    except Exception as e:
-        logger.error(f"Error fetching LinkedIn jobs: {e}")
+    # FIX Issue 10: If all pages failed due to network errors, raise ConnectionError so @auto_heal_sync retries!
+    if not jobs and failed_pages >= len(pages):
+        raise ConnectionError(f"All {failed_pages} LinkedIn pages failed to respond.")
 
     return jobs
 
 
-
+@auto_heal_sync(max_retries=2, delay=1.0, fallback_return=[])
 def fetch_serpapi_google_jobs(query: str, location: str, limit: int = 20) -> List[Dict[str, Any]]:
     """
-    Fetches job listings from Google Jobs via SerpApi (aggregates LinkedIn, Naukri, Indeed, Glassdoor).
+    Fetches job listings from Google Jobs via SerpApi.
+    Protected by AutoHealer retry shield.
     """
     jobs = []
     if not SERPAPI_KEY:
         return jobs
 
-    try:
-        url = "https://serpapi.com/search.json"
-        params = {
-            "engine": "google_jobs",
-            "q": f"{query} in {location}",
-            "hl": "en",
-            "api_key": SERPAPI_KEY,
-        }
-        res = requests.get(url, params=params, timeout=15)
-        if res.status_code == 200:
-            data = res.json()
-            raw_jobs = data.get("jobs_results", [])
-            for r in raw_jobs[:limit]:
-                # Extract best apply link
-                apply_links = r.get("apply_options", [])
-                link = apply_links[0].get("link") if apply_links else ""
-                source_name = apply_links[0].get("title", "Google Jobs") if apply_links else "Google Jobs"
+    url = "https://serpapi.com/search.json"
+    params = {
+        "engine": "google_jobs",
+        "q": f"{query} in {location}",
+        "hl": "en",
+        "api_key": SERPAPI_KEY,
+    }
+    res = requests.get(url, params=params, timeout=12)
+    if res.status_code == 200:
+        data = res.json()
+        raw_jobs = data.get("jobs_results", [])
+        for r in raw_jobs[:limit]:
+            apply_links = r.get("apply_options", [])
+            link = apply_links[0].get("link") if apply_links else ""
+            
+            # FIX Issue 9: Skip jobs with empty links to prevent broken <a href="">
+            if not link:
+                continue
 
-                salary = r.get("detected_extensions", {}).get("salary", "Not Disclosed")
-                posted_at = r.get("detected_extensions", {}).get("posted_at", "Recently")
+            source_name = apply_links[0].get("title", "Google Jobs") if apply_links else "Google Jobs"
+            salary = r.get("detected_extensions", {}).get("salary", "Not Disclosed")
+            posted_at = r.get("detected_extensions", {}).get("posted_at", "Recently")
+            loc = r.get("location", location)
 
-                jobs.append({
-                    "title": r.get("title", ""),
-                    "company": r.get("company_name", ""),
-                    "location": r.get("location", location),
-                    "description": r.get("description", ""),
-                    "salary": salary,
-                    "apply_link": link,
-                    "source": source_name,
-                    "posted_at": posted_at
-                })
-    except Exception as e:
-        logger.error(f"Error in SerpApi fetch: {e}")
+            title = r.get("title", "")
+            company = r.get("company_name", "")
+            if not OutputAuditor.audit_job(query, {"title": title}):
+                continue
+            if not GeoSentinel.verify_location(loc, location):
+                continue
+            if not CompanyTruthSentinel.is_authentic_company(company):
+                continue
+
+            jobs.append({
+                "title": title,
+                "company": r.get("company_name", ""),
+                "location": loc,
+                "description": r.get("description", ""),
+                "salary": salary,
+                "apply_link": link,
+                "source": source_name,
+                "posted_at": posted_at
+            })
 
     return jobs
 
 
 def search_all_jobs(query: str, location: str) -> List[Dict[str, Any]]:
     """
-    Combines results from LinkedIn, Google Jobs, and job aggregators.
-    Deduplicates results based on company name and normalized title.
+    Combines results across sources with autonomous self-healing.
+    If 0 jobs are found, automatically tries alternative verified query terms.
     """
     all_jobs = []
 
-    # 1. First fetch directly from LinkedIn public portal
-    linkedin_jobs = fetch_linkedin_public_jobs(query, location, limit=15)
+    # 1. Fetch from LinkedIn public portal
+    linkedin_jobs = fetch_linkedin_public_jobs(query, location, limit=20)
     all_jobs.extend(linkedin_jobs)
 
-    # 2. If SerpApi key is provided, fetch Google Jobs (Naukri, Indeed, etc.)
+    # 2. Fetch SerpApi if key is provided
     if SERPAPI_KEY:
-        google_jobs = fetch_serpapi_google_jobs(query, location, limit=20)
+        google_jobs = fetch_serpapi_google_jobs(query, location, limit=15)
         all_jobs.extend(google_jobs)
 
-    # Deduplicate
+    # 3. AUTONOMOUS SELF-HEALING:
+    # If 0 jobs found for the exact term, query OutputAuditor for alternative terms
+    if not all_jobs:
+        fallback_query = OutputAuditor.get_self_healing_fallback_query(query, attempt=0)
+        if fallback_query:
+            logger.info(f"[AutoHealer] 0 jobs for '{query}'. Auto-recovering using fallback: '{fallback_query}'")
+            fallback_jobs = fetch_linkedin_public_jobs(fallback_query, location, limit=15)
+            all_jobs.extend(fallback_jobs)
+
+    # Deduplicate results
     seen = set()
     unique_jobs = []
     for j in all_jobs:
